@@ -19,15 +19,15 @@ namespace IOT_ProducerApp
 
             Console.WriteLine($"Sending data every {_interval.TotalSeconds} seconds.");
 
-            _dbContext = new MongoDbContext("IOTDB", "Customers", "Sites", "Devices", "ProductTypes");
+            _dbContext = new MongoDbContext("IOTDB", "Devices", "ProductTypes");
             bool connectionTest = await _dbContext.TestConnection();
             if (!connectionTest)
             {
-                Console.WriteLine("Failed to connect Database");
+                Console.WriteLine("Failed to connect to Database");
                 return;
             }
 
-            // Set up a timer to call the SendData method every 5 seconds
+            // Set up a timer to call the SendData method every interval
             _timer = new Timer(async _ => await SendData(), null, TimeSpan.Zero, _interval);
 
             Console.ReadLine();
@@ -37,7 +37,6 @@ namespace IOT_ProducerApp
         {
             try
             {
-                // Check if _dbContext is initialized
                 if (_dbContext == null)
                 {
                     Console.WriteLine("Database context is not initialized.");
@@ -47,10 +46,10 @@ namespace IOT_ProducerApp
                 // Update cache to reflect any new changes
                 await _dbContext.UpdateCache();
 
-                //Fetch and process all Device Types
+                // Fetch and process all Device Types
                 var message = await ProcessDeviceTypes(_dbContext);
-                Console.WriteLine(message);
                 await RMQProducer.SendMessage(message);
+                Console.WriteLine(message);
                 Console.WriteLine("Data sent to RabbitMQ.");
             }
             catch (Exception ex)
@@ -76,41 +75,41 @@ namespace IOT_ProducerApp
 
             var results = new List<BsonDocument>();
 
-            // Use Parallel.ForEach to speed up processing
-            await Task.Run(() =>
+            // Use a task-based approach to speed up processing
+            var tasks = allSites.Select(site => Task.Run(() =>
             {
-                Parallel.ForEach(allSites, site =>
+                var devices = site.GetValue("Devices", new BsonArray()).AsBsonArray;
+
+                foreach (var device in devices)
                 {
-                    var devices = site.GetValue("Devices", new BsonArray()).AsBsonArray;
+                    var deviceDoc = device.AsBsonDocument;
+                    var deviceId = deviceDoc.GetValue("DeviceID", Guid.Empty).ToString();
+                    var productTypeId = deviceDoc.GetValue("ProductType", Guid.Empty);
 
-                    foreach (var device in devices)
+                    if (deviceTypeDict.TryGetValue(productTypeId, out var deviceType))
                     {
-                        var deviceId = device.AsBsonDocument.GetValue("DeviceID", Guid.Empty).ToString();
-                        var productTypeId = device.AsBsonDocument.GetValue("ProductType", Guid.Empty);
+                        var random = new Random();
+                        var randomNumber = random.NextDouble() * (deviceType.MaxVal - deviceType.MinVal) + deviceType.MinVal;
+                        var formattedRandomNumber = randomNumber.ToString("F2");
+                        var formattedTimestamp = DateTime.UtcNow.ToString("MM-dd-yyyy/HH:mm:tt");
 
-                        if (deviceTypeDict.TryGetValue(productTypeId, out var deviceType))
+                        var result = new BsonDocument
                         {
-                            var random = new Random();
-                            var randomNumber = random.NextDouble() * (deviceType.MaxVal - deviceType.MinVal) + deviceType.MinVal;
-                            var formattedRandomNumber = randomNumber.ToString("F2");
-                            var formattedTimestamp = DateTime.UtcNow.ToString("MM-dd-yyyy/HH:mm:tt");
+                            { "deviceId", deviceId },
+                            { "temperature", formattedRandomNumber },
+                            { "UOM", deviceType.UOM },
+                            { "ScheduledDate", formattedTimestamp }
+                        };
 
-                            var result = new BsonDocument
-                            {
-                                { "deviceId", deviceId },
-                                { "temperature", formattedRandomNumber },
-                                { "UOM", deviceType.UOM },
-                                { "ScheduledDate", formattedTimestamp }
-                            };
-
-                            lock (results)
-                            {
-                                results.Add(result);
-                            }
+                        lock (results)
+                        {
+                            results.Add(result);
                         }
                     }
-                });
-            });
+                }
+            }));
+
+            await Task.WhenAll(tasks);
 
             // Serialize results to JSON format
             var jsonResults = JsonConvert.SerializeObject(results, Formatting.Indented);

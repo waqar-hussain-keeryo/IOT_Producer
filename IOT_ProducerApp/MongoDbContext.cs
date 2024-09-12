@@ -7,62 +7,92 @@ namespace IOT_ProducerApp
     public class MongoDbContext
     {
         private readonly IMongoDatabase _database;
-        private readonly IMongoCollection<BsonDocument> _customerCollection;
-        private readonly IMongoCollection<BsonDocument> _siteCollection;
         private readonly IMongoCollection<BsonDocument> _deviceCollection;
         private readonly IMongoCollection<BsonDocument> _deviceTypeCollection;
 
         private readonly ConcurrentDictionary<Guid, BsonDocument> _deviceCache = new ConcurrentDictionary<Guid, BsonDocument>();
         private readonly ConcurrentDictionary<Guid, BsonDocument> _deviceTypeCache = new ConcurrentDictionary<Guid, BsonDocument>();
+        private readonly TimeSpan _pollingInterval = TimeSpan.FromSeconds(5);
+        private readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
 
-        public MongoDbContext(string databaseName, string customerCollection, string siteCollection, string deviceCollection, string deviceTypeCollection)
+        public MongoDbContext(string databaseName, string deviceCollection, string deviceTypeCollection)
         {
             var client = new MongoClient("mongodb://localhost:27017");
             _database = client.GetDatabase(databaseName);
-            _customerCollection = _database.GetCollection<BsonDocument>(customerCollection);
-            _siteCollection = _database.GetCollection<BsonDocument>(siteCollection);
             _deviceCollection = _database.GetCollection<BsonDocument>(deviceCollection);
             _deviceTypeCollection = _database.GetCollection<BsonDocument>(deviceTypeCollection);
+
+            InitializeCache().Wait();
+            StartPolling();
         }
 
-        public async Task InitializeCache()
+        private async Task InitializeCache()
         {
-            var devices = await _deviceCollection.Find(new BsonDocument()).ToListAsync();
-            foreach (var device in devices)
-            {
-                var deviceId = device.GetValue("DeviceID", BsonNull.Value);
-                _deviceCache[GetGuidFromBsonValue(deviceId)] = device;
-            }
-
-            var deviceTypes = await _deviceTypeCollection.Find(new BsonDocument()).ToListAsync();
-            foreach (var deviceType in deviceTypes)
-            {
-                var productTypeId = deviceType.GetValue("ProductTypeID", BsonNull.Value);
-                _deviceTypeCache[GetGuidFromBsonValue(productTypeId)] = deviceType;
-            }
+            await UpdateCache();
         }
 
         public async Task UpdateCache()
         {
-            var newDevices = await _deviceCollection.Find(new BsonDocument()).ToListAsync();
-            foreach (var device in newDevices)
+            try
             {
-                var deviceId = device.GetValue("DeviceID", BsonNull.Value);
-                _deviceCache[GetGuidFromBsonValue(deviceId)] = device;
-            }
+                var devices = await _deviceCollection.Find(new BsonDocument()).ToListAsync();
+                var deviceTypes = await _deviceTypeCollection.Find(new BsonDocument()).ToListAsync();
 
-            var newDeviceTypes = await _deviceTypeCollection.Find(new BsonDocument()).ToListAsync();
-            foreach (var deviceType in newDeviceTypes)
+                var updatedDeviceCache = new ConcurrentDictionary<Guid, BsonDocument>();
+                foreach (var device in devices)
+                {
+                    var deviceId = device.GetValue("DeviceID", BsonNull.Value);
+                    var id = GetGuidFromBsonValue(deviceId);
+                    if (id != Guid.Empty)
+                    {
+                        updatedDeviceCache[id] = device;
+                    }
+                }
+
+                var updatedDeviceTypeCache = new ConcurrentDictionary<Guid, BsonDocument>();
+                foreach (var deviceType in deviceTypes)
+                {
+                    var productTypeId = deviceType.GetValue("ProductTypeID", BsonNull.Value);
+                    var id = GetGuidFromBsonValue(productTypeId);
+                    if (id != Guid.Empty)
+                    {
+                        updatedDeviceTypeCache[id] = deviceType;
+                    }
+                }
+
+                // Swap caches atomically
+                _deviceCache.Clear();
+                foreach (var kvp in updatedDeviceCache)
+                {
+                    _deviceCache[kvp.Key] = kvp.Value;
+                }
+
+                _deviceTypeCache.Clear();
+                foreach (var kvp in updatedDeviceTypeCache)
+                {
+                    _deviceTypeCache[kvp.Key] = kvp.Value;
+                }
+            }
+            catch (Exception ex)
             {
-                var productTypeId = deviceType.GetValue("ProductTypeID", BsonNull.Value);
-                _deviceTypeCache[GetGuidFromBsonValue(productTypeId)] = deviceType;
+                Console.WriteLine($"Error updating cache: {ex.Message}");
             }
         }
 
-        public IReadOnlyDictionary<Guid, BsonDocument> GetDeviceTypeCache()
+        private void StartPolling()
         {
-            return _deviceTypeCache;
+            Task.Run(async () =>
+            {
+                while (!_cancellationTokenSource.Token.IsCancellationRequested)
+                {
+                    await UpdateCache();
+                    await Task.Delay(_pollingInterval, _cancellationTokenSource.Token);
+                }
+            }, _cancellationTokenSource.Token);
         }
+
+        public IReadOnlyDictionary<Guid, BsonDocument> GetDeviceCache() => _deviceCache;
+        public IReadOnlyDictionary<Guid, BsonDocument> GetDeviceTypeCache() => _deviceTypeCache;
 
         private Guid GetGuidFromBsonValue(BsonValue value)
         {
@@ -74,28 +104,20 @@ namespace IOT_ProducerApp
             switch (value.BsonType)
             {
                 case BsonType.ObjectId:
-                    // Convert ObjectId to Guid if needed
                     return new Guid(value.AsObjectId.ToByteArray());
 
                 case BsonType.String:
-                    // Convert string to Guid if it's in string format
-                    if (Guid.TryParse(value.AsString, out var guid))
-                    {
-                        return guid;
-                    }
-                    break;
+                    return Guid.TryParse(value.AsString, out var guid) ? guid : Guid.Empty;
 
                 case BsonType.Binary:
-                    // Convert Binary to Guid if the binary data represents a Guid
                     var binaryData = value.AsBsonBinaryData;
-                    if (binaryData.SubType == BsonBinarySubType.UuidLegacy || binaryData.SubType == BsonBinarySubType.UuidStandard)
+                    if (binaryData.SubType == BsonBinarySubType.UuidStandard || binaryData.SubType == BsonBinarySubType.UuidLegacy)
                     {
                         return new Guid(binaryData.Bytes);
                     }
                     break;
             }
 
-            // Handle other cases or throw an exception if conversion is not possible
             throw new InvalidCastException($"Cannot convert BSON value to Guid: {value}");
         }
 
@@ -114,15 +136,15 @@ namespace IOT_ProducerApp
             }
         }
 
-        public async Task<List<BsonDocument>> GetAllCustomers()
+        public async Task<List<BsonDocument>> GetAllDeviceTypes()
         {
             try
             {
-                return await _customerCollection.Find(new BsonDocument()).ToListAsync();
+                return await _deviceTypeCollection.Find(new BsonDocument()).ToListAsync();
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error fetching Customers: {ex.Message}");
+                Console.WriteLine($"Error fetching device types: {ex.Message}");
                 return new List<BsonDocument>();
             }
         }
@@ -133,37 +155,20 @@ namespace IOT_ProducerApp
             {
                 var pipeline = new[]
                 {
-            // Unwind the Sites array
-            new BsonDocument("$unwind", "$Sites"),
+                    new BsonDocument("$unwind", "$Sites"),
+                    new BsonDocument("$project", new BsonDocument
+                    {
+                        { "_id", 0 },
+                        { "SiteID", "$Sites.SiteID" },
+                        { "Devices", "$Sites.Devices" }
+                    })
+                };
 
-            // Project the required fields
-            new BsonDocument("$project", new BsonDocument
-            {
-                { "_id", 0 },
-                { "SiteID", "$Sites.SiteID" },
-                { "Devices", "$Sites.Devices" }
-            })
-        };
-
-                var results = await _customerCollection.Aggregate<BsonDocument>(pipeline).ToListAsync();
-                return results;
+                return await _database.GetCollection<BsonDocument>("Customers").Aggregate<BsonDocument>(pipeline).ToListAsync();
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error fetching sites: {ex.Message}");
-                return new List<BsonDocument>();
-            }
-        }
-
-        public async Task<List<BsonDocument>> GetAllDeviceTypes()
-        {
-            try
-            {
-                return await _deviceTypeCollection.Find(new BsonDocument()).ToListAsync();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error fetching device types: {ex.Message}");
                 return new List<BsonDocument>();
             }
         }
