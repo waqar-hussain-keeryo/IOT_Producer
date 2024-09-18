@@ -121,10 +121,10 @@ namespace IOT_ProducerApp
 
                         var result = new BsonDocument
                         {
-                            { "deviceId", deviceId },
-                            { "temperature", formattedRandomNumber },
-                            { "UOM", deviceType.GetValue("UOM", string.Empty).ToString() },
-                            { "ScheduledDate", formattedTimestamp }
+                            { "deviceid", deviceId },
+                            { "value", formattedRandomNumber },
+                            { "uom", deviceType.GetValue("UOM", string.Empty).ToString() },
+                            { "timestamp", formattedTimestamp }
                         };
 
                         results.Add(result);
