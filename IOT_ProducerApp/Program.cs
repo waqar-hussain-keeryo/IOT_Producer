@@ -80,15 +80,23 @@ namespace IOT_ProducerApp
                 // Process device types using cached data
                 var message = await ProcessDeviceTypes(siteCache, deviceTypeCache);
 
-                // Send message to RabbitMQ
-                await RMQProducer.SendMessage(message);
-                Console.WriteLine(message);
+                // Only send message to RabbitMQ if it's not empty
+                if (!string.IsNullOrWhiteSpace(message))
+                {
+                    await RMQProducer.SendMessage(message);
+                    Console.WriteLine(message);
+                }
+                else
+                {
+                    Console.WriteLine("No data available to send.");
+                }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error sending data: {ex.Message}");
             }
         }
+
 
         // Helper method to process device types data and return JSON data
         private static async Task<string> ProcessDeviceTypes(IReadOnlyDictionary<Guid, BsonDocument> siteCache, IReadOnlyDictionary<Guid, BsonDocument> deviceTypeCache)
@@ -134,7 +142,12 @@ namespace IOT_ProducerApp
 
             await Task.WhenAll(tasks); // Ensure all tasks are completed before proceeding
 
-            // Serialize results to JSON format
+            // Serialize results to JSON format only if there are results
+            if (results.Count == 0)
+            {
+                return null;
+            }
+
             var jsonResults = JsonConvert.SerializeObject(results, Formatting.Indented);
             return jsonResults;
         }
