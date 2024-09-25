@@ -1,8 +1,6 @@
 ﻿using MongoDB.Bson;
 using Newtonsoft.Json;
 using System.Collections.Concurrent;
-using System.Threading.Tasks;
-using System.Threading;
 
 namespace IOT_ProducerApp
 {

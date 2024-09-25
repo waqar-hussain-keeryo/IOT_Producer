@@ -10,10 +10,9 @@ namespace IOT_ProducerApp
 
         static RMQProducer()
         {
-            var factory = new ConnectionFactory() { HostName = "localhost" };
+            var factory = new ConnectionFactory() { HostName = Environment.GetEnvironmentVariable("RABBITMQ_HOST") };
             _connection = factory.CreateConnection();
             _channel = _connection.CreateModel();
-            //_channel.ExchangeDeclare(exchange: "AmazonFanoutExchange", type: "fanout");
         }
 
         public static async Task SendMessage(string message)

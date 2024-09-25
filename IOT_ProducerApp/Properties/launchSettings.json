@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "IOT_ProducerApp": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "RABBITMQ_HOST": "localhost",
+        "MONGO_DB_CONNECTION_STRING": "mongodb://localhost:27017"
+      }
+    }
+  }
+}

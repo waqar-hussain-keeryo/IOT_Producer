@@ -28,7 +28,8 @@ namespace IOT_ProducerApp
         public MongoDbContext(string databaseName, string customerCollection, string deviceTypeCollection,
             Action startApplicationProcess, Action stopApplicationProcess)
         {
-            var client = new MongoClient("mongodb://localhost:27017");
+            var mongoConnectionString = Environment.GetEnvironmentVariable("MONGO_DB_CONNECTION_STRING");
+            var client = new MongoClient(mongoConnectionString);
             _database = client.GetDatabase(databaseName);
             _customerCollection = _database.GetCollection<BsonDocument>(customerCollection);
             _deviceTypeCollection = _database.GetCollection<BsonDocument>(deviceTypeCollection);
