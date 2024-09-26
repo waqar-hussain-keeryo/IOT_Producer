@@ -10,13 +10,21 @@ namespace IOT_ProducerApp
         private static MongoDbContext _dbContext;
         private static TimeSpan _interval = TimeSpan.FromSeconds(5);
         private static bool _isFirstRun = true;
+        private static Random _random = new Random();
 
         public static async Task Main(string[] args)
         {
-            // Check if an interval argument was provided
-            if (args.Length > 0 && TimeSpan.TryParse(args[0], out var parsedInterval))
+            // Validate and parse interval argument if provided
+            try
             {
-                _interval = parsedInterval;
+                if (args.Length > 0 && !TimeSpan.TryParse(args[0], out _interval))
+                {
+                    Console.WriteLine($"Invalid interval format: {args[0]}. Using default interval of {_interval.TotalSeconds} seconds.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error parsing interval: {ex.Message}. Using default interval of {_interval.TotalSeconds} seconds.");
             }
 
             Console.WriteLine($"Sending data every {_interval.TotalSeconds} seconds.");
@@ -25,25 +33,35 @@ namespace IOT_ProducerApp
             Action startApplicationProcess = () => Console.WriteLine("Starting application processes...");
             Action stopApplicationProcess = () => Console.WriteLine("Stopping application processes...");
 
-            // Initialize MongoDbContext
-            _dbContext = new MongoDbContext(
-                databaseName: "IOTDB",
-                customerCollection: "Customer",
-                deviceTypeCollection: "ProductTypes",
-                startApplicationProcess: startApplicationProcess,
-                stopApplicationProcess: stopApplicationProcess
-            );
+            try
+            {
+                // Initialize MongoDbContext
+                _dbContext = new MongoDbContext(
+                    databaseName: "IOTDB",
+                    customerCollection: "Customer",
+                    deviceTypeCollection: "ProductTypes",
+                    startApplicationProcess: startApplicationProcess,
+                    stopApplicationProcess: stopApplicationProcess
+                );
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error initializing database context: {ex.Message}");
+                return;
+            }
 
+            // Test MongoDB connection
             bool connectionTest = await _dbContext.TestConnection();
             if (!connectionTest)
             {
-                Console.WriteLine("Failed to connect to Database");
+                Console.WriteLine("Failed to connect to Database.");
                 return;
             }
 
             // Set up a timer to call the SendData method every interval
             _timer = new Timer(async _ => await TimerCallback(), null, TimeSpan.Zero, _interval);
 
+            // Wait for user input to exit
             Console.ReadLine();
         }
 
@@ -81,7 +99,7 @@ namespace IOT_ProducerApp
                 // Only send message to RabbitMQ if it's not empty
                 if (!string.IsNullOrWhiteSpace(message))
                 {
-                    await RMQProducer.SendMessage(message);
+                    RMQProducer.SendMessage(message);
                     Console.WriteLine(message);
                 }
                 else
@@ -91,54 +109,72 @@ namespace IOT_ProducerApp
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error sending data: {ex.Message}");
+                Console.WriteLine($"Error in TimerCallback: {ex.Message}");
+                // Optionally terminate application on critical errors
             }
         }
-
 
         // Helper method to process device types data and return JSON data
         private static async Task<string> ProcessDeviceTypes(IReadOnlyDictionary<Guid, BsonDocument> siteCache, IReadOnlyDictionary<Guid, BsonDocument> deviceTypeCache)
         {
             var results = new ConcurrentBag<BsonDocument>();
 
-            // Use a task-based approach to speed up processing
-            var tasks = siteCache.Select(async siteEntry =>
+            try
             {
-                var site = siteEntry.Value;
-                var devices = site.GetValue("Devices", new BsonArray()).AsBsonArray;
-
-                foreach (var device in devices)
+                var tasks = siteCache.Select(async siteEntry =>
                 {
-                    var deviceDoc = device.AsBsonDocument;
-                    var deviceId = deviceDoc.GetValue("DeviceID", BsonNull.Value).ToString();
-                    var productTypeId = deviceDoc.GetValue("ProductType", BsonNull.Value);
+                    var site = siteEntry.Value;
+                    var devices = site.GetValue("Devices", new BsonArray()).AsBsonArray;
 
-                    // Handle BSON to GUID conversion
-                    Guid productTypeGuid = GetGuidFromBsonValue(productTypeId);
-
-                    if (deviceTypeCache.TryGetValue(productTypeGuid, out var deviceType))
+                    foreach (var device in devices)
                     {
-                        var random = new Random();
-                        var minVal = deviceType.GetValue("MinVal", 0.0).ToDouble();
-                        var maxVal = deviceType.GetValue("MaxVal", 0.0).ToDouble();
-                        var randomNumber = random.NextDouble() * (maxVal - minVal) + minVal;
-                        var formattedRandomNumber = randomNumber.ToString("F2");
-                        var formattedTimestamp = DateTime.UtcNow.ToString("MM-dd-yyyy/HH:mm:tt");
+                        var deviceDoc = device.AsBsonDocument;
 
-                        var result = new BsonDocument
+                        // Check if the device is active by checking the IsDeleted field
+                        var isDeleted = deviceDoc.GetValue("IsDeleted", BsonBoolean.False).AsBoolean;
+                        if (isDeleted)
                         {
-                            { "deviceid", deviceId },
-                            { "value", formattedRandomNumber },
-                            { "uom", deviceType.GetValue("UOM", string.Empty).ToString() },
-                            { "timestamp", formattedTimestamp }
-                        };
+                            continue;
+                        }
 
-                        results.Add(result);
+                        var deviceId = deviceDoc.GetValue("DeviceID", BsonNull.Value).ToString();
+                        var productTypeId = deviceDoc.GetValue("ProductType", BsonNull.Value);
+
+                        // Validate GUID conversion
+                        Guid productTypeGuid = GetGuidFromBsonValue(productTypeId);
+                        if (productTypeGuid == Guid.Empty)
+                        {
+                            Console.WriteLine($"Invalid ProductType ID for device {deviceId}. Skipping...");
+                            continue;
+                        }
+
+                        if (deviceTypeCache.TryGetValue(productTypeGuid, out var deviceType))
+                        {
+                            var minVal = deviceType.GetValue("MinVal", 0.0).ToDouble();
+                            var maxVal = deviceType.GetValue("MaxVal", 0.0).ToDouble();
+                            var randomNumber = _random.NextDouble() * (maxVal - minVal) + minVal;
+                            var formattedRandomNumber = randomNumber.ToString("F2");
+                            var formattedTimestamp = DateTime.UtcNow.ToString("MM-dd-yyyy/HH:mm:tt");
+
+                            var result = new BsonDocument
+                            {
+                                { "deviceid", deviceId },
+                                { "value", formattedRandomNumber },
+                                { "uom", deviceType.GetValue("UOM", string.Empty).ToString() },
+                                { "timestamp", formattedTimestamp }
+                            };
+
+                            results.Add(result);
+                        }
                     }
-                }
-            });
+                });
 
-            await Task.WhenAll(tasks); // Ensure all tasks are completed before proceeding
+                await Task.WhenAll(tasks); // Ensure all tasks are completed before proceeding
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing device types: {ex.Message}");
+            }
 
             // Serialize results to JSON format only if there are results
             if (results.Count == 0)
@@ -158,21 +194,22 @@ namespace IOT_ProducerApp
                 return Guid.Empty;
             }
 
-            switch (value.BsonType)
+            try
             {
-                case BsonType.ObjectId:
-                    return new Guid(value.AsObjectId.ToByteArray());
-
-                case BsonType.String:
-                    return Guid.TryParse(value.AsString, out var guid) ? guid : Guid.Empty;
-
-                case BsonType.Binary:
-                    var binaryData = value.AsBsonBinaryData;
-                    if (binaryData.SubType == BsonBinarySubType.UuidStandard || binaryData.SubType == BsonBinarySubType.UuidLegacy)
-                    {
-                        return new Guid(binaryData.Bytes);
-                    }
-                    break;
+                return value.BsonType switch
+                {
+                    BsonType.ObjectId => new Guid(value.AsObjectId.ToByteArray()),
+                    BsonType.String => Guid.TryParse(value.AsString, out var guid) ? guid : Guid.Empty,
+                    BsonType.Binary => (value.AsBsonBinaryData.SubType == BsonBinarySubType.UuidStandard ||
+                                        value.AsBsonBinaryData.SubType == BsonBinarySubType.UuidLegacy)
+                                        ? new Guid(value.AsBsonBinaryData.Bytes)
+                                        : Guid.Empty,
+                    _ => Guid.Empty
+                };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error converting BSON value to Guid: {ex.Message}");
             }
 
             return Guid.Empty; // Return an empty Guid if conversion fails

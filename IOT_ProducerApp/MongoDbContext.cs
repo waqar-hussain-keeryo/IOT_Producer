@@ -19,8 +19,7 @@ namespace IOT_ProducerApp
         private readonly ConcurrentDictionary<Guid, BsonDocument> _siteCache = new ConcurrentDictionary<Guid, BsonDocument>();
         private readonly ConcurrentDictionary<Guid, BsonDocument> _deviceTypeCache = new ConcurrentDictionary<Guid, BsonDocument>();
 
-        private static bool _isFetchingData = false;
-        private static readonly object _syncLock = new object();
+        private static readonly SemaphoreSlim _cacheLock = new SemaphoreSlim(1, 1);
 
         public IReadOnlyDictionary<Guid, BsonDocument> GetSiteCache() => _siteCache;
         public IReadOnlyDictionary<Guid, BsonDocument> GetDeviceTypeCache() => _deviceTypeCache;
@@ -29,16 +28,37 @@ namespace IOT_ProducerApp
             Action startApplicationProcess, Action stopApplicationProcess)
         {
             var mongoConnectionString = Environment.GetEnvironmentVariable("MONGO_DB_CONNECTION_STRING");
-            var client = new MongoClient(mongoConnectionString);
-            _database = client.GetDatabase(databaseName);
-            _customerCollection = _database.GetCollection<BsonDocument>(customerCollection);
-            _deviceTypeCollection = _database.GetCollection<BsonDocument>(deviceTypeCollection);
+
+            // Validate the MongoDB connection string
+            if (string.IsNullOrWhiteSpace(mongoConnectionString))
+            {
+                throw new ArgumentException("MONGO_DB_CONNECTION_STRING environment variable is not set or empty.");
+            }
+
+            try
+            {
+                var client = new MongoClient(mongoConnectionString);
+                _database = client.GetDatabase(databaseName);
+                _customerCollection = _database.GetCollection<BsonDocument>(customerCollection);
+                _deviceTypeCollection = _database.GetCollection<BsonDocument>(deviceTypeCollection);
+            }
+            catch (MongoConfigurationException ex)
+            {
+                Console.Error.WriteLine($"Invalid MongoDB configuration: {ex.Message}");
+                throw new InvalidOperationException("Failed to initialize MongoDB context.", ex);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Failed to initialize MongoDB connection: {ex.Message}");
+                throw;
+            }
 
             _startApplicationProcess = startApplicationProcess ?? throw new ArgumentNullException(nameof(startApplicationProcess));
             _stopApplicationProcess = stopApplicationProcess ?? throw new ArgumentNullException(nameof(stopApplicationProcess));
 
             InitializeCache().Wait();
             StartPolling();
+            WatchDeviceTypeCollection();
         }
 
         // Test database connection
@@ -52,12 +72,12 @@ namespace IOT_ProducerApp
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Connection failed: {ex.Message}");
+                Console.WriteLine($"Connection test failed: {ex.Message}");
                 return false;
             }
         }
 
-        // Get all sites from database
+        // Get all sites from the database, with error handling
         public async Task<List<BsonDocument>> GetAllSites()
         {
             try
@@ -75,6 +95,11 @@ namespace IOT_ProducerApp
 
                 return await _database.GetCollection<BsonDocument>("Customers").Aggregate<BsonDocument>(pipeline).ToListAsync();
             }
+            catch (MongoException ex)
+            {
+                Console.WriteLine($"MongoDB error fetching sites: {ex.Message}");
+                return new List<BsonDocument>();
+            }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error fetching sites: {ex.Message}");
@@ -82,12 +107,17 @@ namespace IOT_ProducerApp
             }
         }
 
-        // Get all deviceTypes from database
+        // Get all device types from the database
         public async Task<List<BsonDocument>> GetAllDeviceTypes()
         {
             try
             {
                 return await _deviceTypeCollection.Find(new BsonDocument()).ToListAsync();
+            }
+            catch (MongoException ex)
+            {
+                Console.WriteLine($"MongoDB error fetching device types: {ex.Message}");
+                return new List<BsonDocument>();
             }
             catch (Exception ex)
             {
@@ -96,24 +126,21 @@ namespace IOT_ProducerApp
             }
         }
 
-        // Initialize Cache in-memory
+        // Initialize in-memory cache
         private async Task InitializeCache()
         {
             await UpdateCache();
         }
 
-        // Update cache
+        // Update cache with thread safety
         public async Task UpdateCache()
         {
+            await _cacheLock.WaitAsync();
             try
             {
-                lock (_syncLock)
-                {
-                    _isFetchingData = true;
-                }
-                _stopApplicationProcess?.Invoke(); // Stop RabbitMQ operations
+                _stopApplicationProcess?.Invoke(); // Stop RabbitMQ or other operations
 
-                // Fetch and update sites
+                // Update site cache
                 var sites = await GetAllSites();
                 var updatedSiteCache = new ConcurrentDictionary<Guid, BsonDocument>();
                 foreach (var site in sites)
@@ -127,12 +154,12 @@ namespace IOT_ProducerApp
                 }
 
                 _siteCache.Clear();
-                foreach (var key in updatedSiteCache)
+                foreach (var entry in updatedSiteCache)
                 {
-                    _siteCache[key.Key] = key.Value;
+                    _siteCache[entry.Key] = entry.Value;
                 }
 
-                // Fetch and update device types
+                // Update device type cache
                 var deviceTypes = await GetAllDeviceTypes();
                 var updatedDeviceTypeCache = new ConcurrentDictionary<Guid, BsonDocument>();
                 foreach (var deviceType in deviceTypes)
@@ -146,9 +173,9 @@ namespace IOT_ProducerApp
                 }
 
                 _deviceTypeCache.Clear();
-                foreach (var key in updatedDeviceTypeCache)
+                foreach (var entry in updatedDeviceTypeCache)
                 {
-                    _deviceTypeCache[key.Key] = key.Value;
+                    _deviceTypeCache[entry.Key] = entry.Value;
                 }
             }
             catch (Exception ex)
@@ -157,15 +184,36 @@ namespace IOT_ProducerApp
             }
             finally
             {
-                lock (_syncLock)
-                {
-                    _isFetchingData = false;
-                }
-                _startApplicationProcess?.Invoke(); // Resume RabbitMQ operations
+                _startApplicationProcess?.Invoke(); // Resume RabbitMQ or other operations
+                _cacheLock.Release();
             }
         }
 
-        // Start Polling in 1 hour to fetch new records from database
+        // Watch for new devices being added
+        public void WatchDeviceTypeCollection()
+        {
+            Task.Run(async () =>
+            {
+                var changeStreamOptions = new ChangeStreamOptions
+                {
+                    FullDocument = ChangeStreamFullDocumentOption.UpdateLookup
+                };
+
+                using (var changeStream = _deviceTypeCollection.Watch(changeStreamOptions))
+                {
+                    await changeStream.ForEachAsync(change =>
+                    {
+                        if (change.OperationType == ChangeStreamOperationType.Insert)
+                        {
+                            Console.WriteLine("New device added, updating cache...");
+                            UpdateCache().Wait(); // You might want to make this async properly
+                        }
+                    });
+                }
+            });
+        }
+
+        // Polling method to periodically fetch records from the database
         private void StartPolling()
         {
             Task.Run(async () =>
@@ -173,12 +221,16 @@ namespace IOT_ProducerApp
                 while (!_cancellationTokenSource.Token.IsCancellationRequested)
                 {
                     await UpdateCache();
-                    await Task.Delay(_pollingTime, _cancellationTokenSource.Token);
+                    try
+                    {
+                        await Task.Delay(_pollingTime, _cancellationTokenSource.Token);
+                    }
+                    catch (TaskCanceledException) { }
                 }
             }, _cancellationTokenSource.Token);
         }
 
-        // Helper method to check BSON ID and convert into Guid ID 
+        // Helper method to convert BSON ID to Guid
         private Guid GetGuidFromBsonValue(BsonValue value)
         {
             if (value == BsonNull.Value)
@@ -186,24 +238,24 @@ namespace IOT_ProducerApp
                 return Guid.Empty;
             }
 
-            switch (value.BsonType)
+            try
             {
-                case BsonType.ObjectId:
-                    return new Guid(value.AsObjectId.ToByteArray());
-
-                case BsonType.String:
-                    return Guid.TryParse(value.AsString, out var guid) ? guid : Guid.Empty;
-
-                case BsonType.Binary:
-                    var binaryData = value.AsBsonBinaryData;
-                    if (binaryData.SubType == BsonBinarySubType.UuidStandard || binaryData.SubType == BsonBinarySubType.UuidLegacy)
-                    {
-                        return new Guid(binaryData.Bytes);
-                    }
-                    break;
+                return value.BsonType switch
+                {
+                    BsonType.ObjectId => new Guid(value.AsObjectId.ToByteArray()),
+                    BsonType.String => Guid.TryParse(value.AsString, out var guid) ? guid : Guid.Empty,
+                    BsonType.Binary => (value.AsBsonBinaryData.SubType == BsonBinarySubType.UuidStandard ||
+                                        value.AsBsonBinaryData.SubType == BsonBinarySubType.UuidLegacy)
+                                        ? new Guid(value.AsBsonBinaryData.Bytes)
+                                        : Guid.Empty,
+                    _ => throw new InvalidCastException($"Cannot convert BSON value to Guid: {value}")
+                };
             }
-
-            throw new InvalidCastException($"Cannot convert BSON value to Guid: {value}");
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error converting BSON value to Guid: {ex.Message}");
+                return Guid.Empty;
+            }
         }
 
         public void StartApplicationProcess()
